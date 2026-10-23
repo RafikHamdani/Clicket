@@ -164,7 +164,7 @@ li.clickable:hover .t { color: var(--accent); }
 
 .month-nav { display: inline-flex; align-items: center; gap: 6px; }
 .month-nav button { border: 1px solid var(--line); background: var(--surface); border-radius: 9px; width: 34px; height: 34px; }
-.month-nav span { min-width: 120px; text-align: center; font-weight: 600; text-transform: capitalize; }
+.month-nav span { min-width: 120px; text-align: center; font-weight: 600; }
 
 /* Advisor */
 .chat { display: grid; grid-template-rows: auto 1fr auto; gap: 14px; min-height: 60vh; }
@@ -242,7 +242,7 @@ li.clickable:hover .t { color: var(--accent); }
         <div class="chat-log" id="chat-log" aria-live="polite"></div>
         <div style="display:grid;gap:10px">
           <div class="chips" id="chat-chips">
-            <button class="chip" type="button">Fais le bilan de mon mois</button>
+            <button class="chip" type="button">Fais le bilan de ma paie actuelle</button>
             <button class="chip" type="button">Comment rembourser mes dettes plus vite ?</button>
             <button class="chip" type="button">Combien je peux épargner chaque mois ?</button>
             <button class="chip" type="button">Où est-ce que je dépense trop ?</button>
@@ -309,7 +309,7 @@ let loaded = false, mode = "loading";
 let docRef = null, chatRef = null, writing = false, dirty = false;
 let tab = "apercu";
 const now0 = today();
-let viewMonth = { y: now0.getFullYear(), m: now0.getMonth() };
+let viewAnchor = now0; // any day inside the pay period shown on the Dépenses tab
 
 const LS_KEY = "mon-budget-v1", LS_CHAT = "mon-budget-chat-v1";
 const lsGet = k => { try { return JSON.parse(localStorage.getItem(k) || "null"); } catch { return null; } };
@@ -351,42 +351,68 @@ function payDates(p, start, end) {
   if (!p.firstDate) return [];
   const f = parse(p.firstDate);
   if (p.freq === "unique") return f >= start && f <= end ? [f] : [];
-  if (p.freq === "mensuel") return monthlyDates(f.getDate(), start, end, f);
+  // A recurring pay's date is only a reference point: the schedule runs both ways from it.
+  if (p.freq === "mensuel") return monthlyDates(f.getDate(), start, end);
   const step = p.freq === "hebdo" ? 7 : 14;
-  let d = f;
-  if (d < start) d = addDays(f, Math.ceil(dayDiff(f, start) / step) * step);
+  let d = addDays(f, Math.ceil(dayDiff(f, start) / step) * step);
   const out = [];
   while (d <= end) { out.push(d); d = addDays(d, step); }
   return out;
 }
+/* Pay periods: from one recurring payday to the day before the next one. */
+function boundaries(start, end) {
+  const set = new Set();
+  for (const p of state.paies) if (p.freq !== "unique") for (const d of payDates(p, start, end)) set.add(iso(d));
+  return [...set].sort();
+}
+function periodOf(date) {
+  const key = iso(date), b = boundaries(addDays(date, -70), addDays(date, 70));
+  let s = null, n = null;
+  for (const x of b) { if (x <= key) s = x; else { n = x; break; } }
+  if (!s && !n) {
+    const y = date.getFullYear(), m = date.getMonth();
+    return { start: new Date(y, m, 1), end: new Date(y, m, dim(y, m)), monthly: true };
+  }
+  const start = s ? parse(s) : addDays(parse(n), -14);
+  return { start, end: n ? addDays(parse(n), -1) : addDays(start, 13) };
+}
+const prevPeriod = p => periodOf(addDays(p.start, -1));
+const nextPeriod = p => periodOf(addDays(p.end, 1));
+function periodLabel(p, short) {
+  if (p.monthly) return fmtMonth(p.start.getFullYear(), p.start.getMonth());
+  const s = p.start.toLocaleDateString("fr-FR", { day: "numeric", month: "short" });
+  return short ? `Paie du ${s}` : `Paie du ${s} → ${p.end.toLocaleDateString("fr-FR", { day: "numeric", month: "short" })}`;
+}
+const PAY_FREQ = [["mensuel", "Chaque mois, à un jour fixe"], ["paie", "À chaque paie (toutes les 2 semaines)"]];
+function recurDates(item, dayField, start, end) {
+  return item.freq === "paie" ? boundaries(start, end).map(parse) : monthlyDates(+item[dayField] || 1, start, end);
+}
 function events(start, end) {
   const ev = [];
   for (const p of state.paies) for (const d of payDates(p, start, end)) ev.push({ d, label: p.label, amount: +p.amount, kind: "pay", id: p.id });
-  for (const c of state.charges) for (const d of monthlyDates(+c.day || 1, start, end)) ev.push({ d, label: c.label, amount: -c.amount, kind: "charge", cat: c.cat, id: c.id });
-  for (const t of state.dettes) if (+t.remaining > 0 && +t.monthly > 0) for (const d of monthlyDates(+t.dueDay || 1, start, end)) ev.push({ d, label: t.label, amount: -Math.min(+t.monthly, +t.remaining), kind: "debt", id: t.id });
+  for (const c of state.charges) for (const d of recurDates(c, "day", start, end)) ev.push({ d, label: c.label, amount: -c.amount, kind: "charge", cat: c.cat, id: c.id });
+  for (const t of state.dettes) if (+t.remaining > 0 && +t.monthly > 0) for (const d of recurDates(t, "dueDay", start, end)) ev.push({ d, label: t.label, amount: -Math.min(+t.monthly, +t.remaining), kind: "debt", id: t.id });
   ev.sort((a, b) => a.d - b.d || b.amount - a.amount);
   return ev;
 }
-function monthKey(y, m) { return `${y}-${pad(m + 1)}`; }
-function monthStats(y, m) {
-  const start = new Date(y, m, 1), end = new Date(y, m, dim(y, m));
-  const ev = events(start, end);
+function periodStats(p) {
+  const ev = events(p.start, p.end);
   const income = ev.filter(e => e.kind === "pay").reduce((s, e) => s + e.amount, 0);
   const charges = -ev.filter(e => e.kind === "charge").reduce((s, e) => s + e.amount, 0);
   const debts = -ev.filter(e => e.kind === "debt").reduce((s, e) => s + e.amount, 0);
-  const key = monthKey(y, m);
-  const deps = state.depenses.filter(d => String(d.date).startsWith(key));
+  const a = iso(p.start), z = iso(p.end);
+  const deps = state.depenses.filter(d => d.date >= a && d.date <= z);
   const spent = deps.reduce((s, d) => s + +d.amount, 0);
   const byCat = {};
   for (const d of deps) byCat[d.cat || "Autre"] = (byCat[d.cat || "Autre"] || 0) + +d.amount;
-  return { income, charges, debts, spent, left: income - charges - debts - spent, byCat, deps };
+  return { income, charges, debts, spent, left: income - charges - debts - spent, byCat, deps, ev };
 }
 function nextPay() {
   const t = today(), ev = events(t, addDays(t, 400)).filter(e => e.kind === "pay");
   return ev[0] || null;
 }
 function payoff(t) {
-  const B = +t.remaining, P = +t.monthly, r = (+t.rate || 0) / 1200;
+  const B = +t.remaining, P = t.freq === "paie" ? +t.monthly * 26 / 12 : +t.monthly, r = (+t.rate || 0) / 1200;
   if (!(B > 0)) return { months: 0, interest: 0 };
   if (!(P > 0)) return null;
   let n;
@@ -421,7 +447,7 @@ function renderApercu() {
       <button class="btn" data-act="add" data-kind="paies" type="button">Ajouter ma paie</button>
       <button class="btn ghost" data-act="load-example" type="button">Voir avec un exemple</button>
     </div></div>`;
-  const t = today(), st = monthStats(t.getFullYear(), t.getMonth()), np = nextPay();
+  const t = today(), per = periodOf(t), st = periodStats(per), np = nextPay();
   let payHtml;
   if (np) {
     const n = dayDiff(t, np.d);
@@ -430,13 +456,13 @@ function renderApercu() {
       <div class="sub">${esc(fmtDay(np.d))} · ${esc(np.label)} · <span class="amt">${money(np.amount)}</span></div></div>`;
   } else payHtml = `<div class="card payday"><div class="eyebrow">Prochaine paie</div><div class="big">À définir</div><div class="sub"><button class="btn ghost small" style="color:inherit;border-color:currentColor" data-act="add" data-kind="paies" type="button">Ajouter une paie</button></div></div>`;
   const leftCls = st.left < 0 ? "neg" : st.left < st.income * 0.1 ? "warn" : "pos";
-  const rav = `<div class="card rav"><div class="eyebrow">Reste à vivre en ${esc(fmtMonth(t.getFullYear(), t.getMonth()).split(" ")[0])}</div>
+  const rav = `<div class="card rav"><div class="eyebrow">${per.monthly ? "Reste à vivre ce mois-ci" : `Reste à vivre jusqu'au ${esc(per.end.toLocaleDateString("fr-FR", { day: "numeric", month: "short" }))}`}</div>
     <div class="val ${leftCls}">${money(st.left)}</div>
-    <div class="small muted">Revenus du mois moins charges, mensualités et dépenses déjà notées.</div></div>`;
+    <div class="small muted">${esc(periodLabel(per))} : paie moins charges, dettes et dépenses de la période.</div></div>`;
   const figs = `<div class="card"><div class="figs">
-    <div><span class="eyebrow">Revenus</span><span class="v pos">${money(st.income)}</span></div>
-    <div><span class="eyebrow">Charges fixes</span><span class="v">${money(st.charges)}</span></div>
-    <div><span class="eyebrow">Mensualités</span><span class="v">${money(st.debts)}</span></div>
+    <div><span class="eyebrow">Paie</span><span class="v pos">${money(st.income)}</span></div>
+    <div><span class="eyebrow">Charges</span><span class="v">${money(st.charges)}</span></div>
+    <div><span class="eyebrow">Dettes</span><span class="v">${money(st.debts)}</span></div>
     <div><span class="eyebrow">Dépensé</span><span class="v">${money(st.spent)}</span></div></div></div>`;
 
   // 30-day projection
@@ -462,10 +488,10 @@ function renderApercu() {
   const cats = Object.entries(st.byCat).sort((a, b) => b[1] - a[1]);
   const max = cats.length ? cats[0][1] : 1;
   const spend = `<div class="card" style="display:grid;gap:14px">
-    <div class="sec-head"><h2>Dépenses du mois</h2><button class="btn small" data-act="add" data-kind="depenses" type="button">+ Dépense</button></div>
+    <div class="sec-head"><h2>Dépenses de cette paie</h2><button class="btn small" data-act="add" data-kind="depenses" type="button">+ Dépense</button></div>
     ${cats.length ? `<div class="bars">${cats.map(([c, v]) => `<div class="bar-row"><span>${esc(c)}</span><div class="bar-track"><div class="bar-fill" style="width:${Math.max(3, v / max * 100)}%"></div></div><span class="num">${money(v)}</span></div>`).join("")}</div>`
-      : `<div class="empty">Aucune dépense notée ce mois-ci. Ajoutez vos courses, sorties ou achats pour suivre où va l'argent.</div>`}
-    <button class="btn ghost small" data-act="ask" data-q="Fais le bilan de mon mois" type="button" style="justify-self:start">Demander un bilan au conseiller</button></div>`;
+      : `<div class="empty">Aucune dépense notée sur cette paie. Ajoutez vos courses, sorties ou achats pour suivre où va l'argent.</div>`}
+    <button class="btn ghost small" data-act="ask" data-q="Fais le bilan de ma paie actuelle" type="button" style="justify-self:start">Demander un bilan au conseiller</button></div>`;
 
   return `<div class="hero">${payHtml}${rav}</div>${figs}<div class="two">${projection}${spend}</div>`;
 }
@@ -486,31 +512,35 @@ function renderPaies() {
       <div class="row-main"><div class="t">${esc(p.label)}</div><div class="s">${esc(freqLabel(p.freq))}${nx ? ` · prochaine le ${esc(fmtDay(nx))}` : ""}</div></div>
       <div class="row-end"><span class="num pos">${money(+p.amount)}</span></div></li>`;
   }, "Aucune paie. Ajoutez votre salaire avec la date d'une paie et sa fréquence : les suivantes sont calculées automatiquement.", "+ Paie");
-  const cal = `<div class="card" style="display:grid;gap:10px"><h2>Calendrier des 3 prochains mois</h2>
-    ${ev.length ? `<ul class="rows">${ev.map(e => `<li>${dateChip(e.d)}<div class="row-main"><div class="t">${esc(e.label)}</div><div class="s">${esc(fmtDay(e.d))} · dans ${dayDiff(t, e.d)} j</div></div><div class="row-end"><span class="num pos">${money(e.amount)}</span></div></li>`).join("")}</ul>`
+  const cal = `<div class="card" style="display:grid;gap:10px"><h2>Mes prochaines paies</h2>
+    ${ev.length ? `<ul class="rows">${ev.map(e => `<li>${dateChip(e.d)}<div class="row-main"><div class="t">${esc(e.label)}</div><div class="s">${esc(fmtDay(e.d))} · dans ${dayDiff(t, e.d)} j</div></div><div class="row-end"><span class="num pos">${money(e.amount)}</span>${(() => { const ps = periodStats(periodOf(e.d)); return ps.ev.some(x => x.kind !== "pay") ? `<span class="bal num">après charges et dettes : ${money(ps.income - ps.charges - ps.debts)}</span>` : ""; })()}</div></li>`).join("")}</ul>`
       : `<div class="empty">Les prochaines dates de paie apparaîtront ici.</div>`}</div>`;
   return `<div class="two">${list}${cal}</div>`;
 }
 
 function renderDepenses() {
-  const totalCharges = state.charges.reduce((s, c) => s + +c.amount, 0);
-  const charges = listCard("Charges fixes mensuelles", "charges", [...state.charges].sort((a, b) => a.day - b.day), c =>
-    `<li class="clickable" data-act="edit" data-kind="charges" data-id="${c.id}"><div class="date-chip"><b>${+c.day}</b><span>du mois</span></div>
-      <div class="row-main"><div class="t">${esc(c.label)}</div><div class="s">${esc(c.cat || "Autre")}</div></div>
+  const per = periodOf(viewAnchor), st = periodStats(per);
+  const inPer = new Set(st.ev.filter(e => e.kind === "charge").map(e => e.id));
+  const perCharges = st.ev.filter(e => e.kind === "charge").reduce((s, e) => s - e.amount, 0);
+  const charges = listCard("Charges fixes", "charges", [...state.charges].sort((a, b) => (a.freq === "paie" ? 0 : +a.day) - (b.freq === "paie" ? 0 : +b.day)), c =>
+    `<li class="clickable" data-act="edit" data-kind="charges" data-id="${c.id}">${c.freq === "paie" ? `<div class="date-chip"><b>2</b><span>sem.</span></div>` : `<div class="date-chip"><b>${+c.day}</b><span>du mois</span></div>`}
+      <div class="row-main"><div class="t">${esc(c.label)}</div><div class="s">${esc(c.cat || "Autre")} · ${c.freq === "paie" ? "à chaque paie" : "chaque mois"}${inPer.has(c.id) ? ` · <span class="tag pay">sur cette paie</span>` : ""}</div></div>
       <div class="row-end"><span class="num">${money(+c.amount)}</span></div></li>`,
     "Aucune charge fixe. Ajoutez loyer, électricité, téléphone, assurances, abonnements…", "+ Charge",
-    state.charges.length ? `<div class="small muted">Total : <b class="num" style="color:var(--ink)">${money(totalCharges)}</b> par mois</div>` : "");
-  const { y, m } = viewMonth, st = monthStats(y, m);
+    state.charges.length ? `<div class="small muted">Sur la ${esc(periodLabel(per, true).toLowerCase())} : <b class="num" style="color:var(--ink)">${money(perCharges)}</b></div>` : "");
   const deps = [...st.deps].sort((a, b) => String(b.date).localeCompare(String(a.date)));
-  const nav = `<div class="month-nav"><button type="button" data-act="month" data-d="-1" aria-label="Mois précédent">‹</button><span>${esc(fmtMonth(y, m))}</span><button type="button" data-act="month" data-d="1" aria-label="Mois suivant">›</button></div>`;
+  const isNow = iso(per.start) === iso(periodOf(today()).start);
+  const nav = `<div class="month-nav"><button type="button" data-act="period" data-d="-1" aria-label="Paie précédente">‹</button><span style="min-width:150px">${esc(periodLabel(per, true))}${isNow ? " (actuelle)" : ""}</span><button type="button" data-act="period" data-d="1" aria-label="Paie suivante">›</button></div>`;
   const depCard = `<div class="card" style="display:grid;gap:10px">
     <div class="sec-head"><h2>Dépenses</h2><button class="btn small" data-act="add" data-kind="depenses" type="button">+ Dépense</button></div>
     <div class="sec-head">${nav}<span class="small muted">Total <b class="num" style="color:var(--ink)">${money(st.spent)}</b></span></div>
-    ${deps.length ? `<ul class="rows">${deps.map(d => `<li class="clickable" data-act="edit" data-kind="depenses" data-id="${d.id}">${dateChip(parse(d.date))}
+    <div class="small muted">${esc(periodLabel(per))} · reste <b class="num ${st.left < 0 ? "neg" : "pos"}">${money(st.left)}</b></div>
+    ${deps.length ? `<ul class="rows">${deps.map(d => `<li class="clickable" data-act="edit" data-kind="depenses" data-id="${d.id}">
+      <div class="date-chip"><b>${esc((d.cat || "Autre").slice(0, 1))}</b><span>${esc((d.cat || "Autre").slice(0, 5))}</span></div>
       <div class="row-main"><div class="t">${esc(d.label)}</div><div class="s">${esc(d.cat || "Autre")}</div></div>
       <div class="row-end"><span class="num">${money(-d.amount)}</span></div></li>`).join("")}</ul>`
-      : `<div class="empty">Aucune dépense ce mois-ci.</div>`}
-    <div class="small muted">Inutile d'ajouter ici vos charges fixes ou vos mensualités de dettes : elles sont déjà comptées.</div></div>`;
+      : `<div class="empty">Aucune dépense sur cette paie.</div>`}
+    <div class="small muted">Inutile d'ajouter ici vos charges fixes ou vos paiements de dettes : ils sont déjà comptés.</div></div>`;
   return `<div class="two">${depCard}${charges}</div>`;
 }
 
@@ -519,13 +549,14 @@ function renderDettes() {
   if (!ds.length) return `<div class="card empty"><h2 style="color:var(--ink)">Mes dettes</h2>
     <p style="margin:0;max-width:60ch">Ajoutez vos cartes de crédit, prêts, découverts ou argent dû à un proche. L'appli calcule la date de fin, les intérêts restants et l'ordre de remboursement le plus économique.</p>
     <button class="btn" data-act="add" data-kind="dettes" type="button">+ Ajouter une dette</button></div>`;
-  const total = ds.reduce((s, t) => s + +t.remaining, 0), monthly = ds.filter(t => +t.remaining > 0).reduce((s, t) => s + +t.monthly, 0);
+  const total = ds.reduce((s, t) => s + +t.remaining, 0), perNow = periodOf(today());
+  const perDebts = periodStats(perNow).ev.filter(e => e.kind === "debt").reduce((s, e) => s - e.amount, 0);
   const order = ds.filter(t => +t.remaining > 0).sort((a, b) => (+b.rate || 0) - (+a.rate || 0) || +a.remaining - +b.remaining);
   const rank = new Map(order.map((t, i) => [t.id, i + 1]));
   const lastDone = ds.filter(t => +t.remaining > 0).map(payoff).filter(Boolean).reduce((mx, p) => Math.max(mx, p.months), 0);
   const summary = `<div class="card"><div class="figs">
     <div><span class="eyebrow">Total restant</span><span class="v neg">${money(total)}</span></div>
-    <div><span class="eyebrow">Mensualités</span><span class="v">${money(monthly)}</span></div>
+    <div><span class="eyebrow">${perNow.monthly ? "Ce mois-ci" : "Sur cette paie"}</span><span class="v">${money(perDebts)}</span></div>
     <div><span class="eyebrow">Libre de dettes</span><span class="v">${lastDone === Infinity ? "jamais" : lastDone ? esc(addMonths(lastDone).toLocaleDateString("fr-FR", { month: "short", year: "numeric" })) : "fait"}</span></div>
     <div><span class="eyebrow">Priorité</span><span class="v" style="font-family:var(--f-body);font-size:.95rem">${order[0] ? esc(order[0].label) : "—"}</span></div></div></div>`;
   const cards = ds.map(t => {
@@ -534,18 +565,18 @@ function renderDettes() {
     const end = !po ? "—" : po.months === Infinity ? "jamais" : po.months === 0 ? "remboursée" : addMonths(po.months).toLocaleDateString("fr-FR", { month: "short", year: "numeric" });
     const r = rank.get(t.id);
     return `<div class="card debt">
-      <div class="debt-top"><div><div class="t">${esc(t.label)}</div><div class="small muted">${+t.rate ? `${String(+t.rate).replace(".", ",")} % par an` : "sans intérêts"} · le ${+t.dueDay || 1} du mois</div></div>
+      <div class="debt-top"><div><div class="t">${esc(t.label)}</div><div class="small muted">${+t.rate ? `${String(+t.rate).replace(".", ",")} % par an` : "sans intérêts"} · ${t.freq === "paie" ? "à chaque paie" : `le ${+t.dueDay || 1} du mois`}</div></div>
         ${+t.remaining <= 0 ? `<span class="tag pay">Remboursée</span>` : r === 1 ? `<span class="tag danger">À rembourser en premier</span>` : `<span class="tag">Priorité ${r}</span>`}</div>
       <div class="progress" role="progressbar" aria-valuenow="${Math.round(pct)}" aria-valuemin="0" aria-valuemax="100"><div style="width:${pct}%"></div></div>
       <div class="kv">
         <div><span class="k">Restant</span><span class="v">${money(+t.remaining)}</span></div>
-        <div><span class="k">Mensualité</span><span class="v">${money(+t.monthly)}</span></div>
+        <div><span class="k">${t.freq === "paie" ? "Par paie" : "Par mois"}</span><span class="v">${money(+t.monthly)}</span></div>
         <div><span class="k">Fin prévue</span><span class="v">${esc(end)}</span></div>
         <div><span class="k">Intérêts restants</span><span class="v">${po && isFinite(po.months) ? "≈ " + money(Math.round(po.interest)) : "—"}</span></div>
       </div>
-      ${po && po.months === Infinity ? `<div class="small neg">La mensualité ne couvre pas les intérêts : la dette ne baisse pas.</div>` : ""}
+      ${po && po.months === Infinity ? `<div class="small neg">Le paiement ne couvre pas les intérêts : la dette ne baisse pas.</div>` : ""}
       <div class="debt-actions">
-        ${+t.remaining > 0 ? `<button class="btn small" data-act="paid" data-id="${t.id}" type="button">Mensualité payée</button>` : ""}
+        ${+t.remaining > 0 ? `<button class="btn small" data-act="paid" data-id="${t.id}" type="button">Paiement fait</button>` : ""}
         <button class="btn ghost small" data-act="edit" data-kind="dettes" data-id="${t.id}" type="button">Modifier</button>
       </div></div>`;
   }).join("");
@@ -556,24 +587,35 @@ function renderDettes() {
 const FORMS = {
   paies: { title: "Paie", fields: [
     ["label", "Nom", "text", "Salaire"], ["amount", "Montant net reçu", "money"],
-    ["firstDate", "Date d'une paie (passée ou à venir)", "date"], ["freq", "Fréquence", "select", FREQS]] },
+    ["firstDate", "Date d'une de vos paies (la dernière ou la prochaine)", "date"], ["freq", "Fréquence", "select", FREQS]] },
   charges: { title: "Charge fixe", fields: [
-    ["label", "Nom", "text", "Loyer"], ["amount", "Montant par mois", "money"],
-    ["day", "Jour du prélèvement (1 à 31)", "int"], ["cat", "Catégorie", "select", CAT_CHARGES.map(c => [c, c])]] },
+    ["label", "Nom", "text", "Loyer"], ["amount", "Montant de chaque prélèvement", "money"],
+    ["freq", "Quand ?", "select", PAY_FREQ], ["day", "Jour du prélèvement (1 à 31)", "int"],
+    ["cat", "Catégorie", "select", CAT_CHARGES.map(c => [c, c])]] },
   depenses: { title: "Dépense", fields: [
     ["label", "Description", "text", "Courses"], ["amount", "Montant", "money"],
-    ["date", "Date", "date"], ["cat", "Catégorie", "select", CAT_DEP.map(c => [c, c])]] },
+    ["date", "Sur quelle paie ?", "payperiod"], ["cat", "Catégorie", "select", CAT_DEP.map(c => [c, c])]] },
   dettes: { title: "Dette", fields: [
     ["label", "Nom", "text", "Carte de crédit"], ["total", "Montant de départ", "money"],
-    ["remaining", "Montant restant à payer", "money"], ["monthly", "Mensualité", "money"],
+    ["remaining", "Montant restant à payer", "money"], ["freq", "Je rembourse", "select", PAY_FREQ],
+    ["monthly", "Montant de chaque paiement", "money"],
     ["rate", "Taux d'intérêt annuel (%)", "rate", "", "Laissez 0 si sans intérêts."], ["dueDay", "Jour du paiement (1 à 31)", "int"]] },
 };
 const DEFAULTS = {
-  paies: () => ({ freq: "mensuel", firstDate: iso(today()) }),
-  charges: () => ({ day: 1, cat: "Logement" }),
-  depenses: () => ({ date: iso(today()), cat: "Épicerie" }),
-  dettes: () => ({ rate: 0, dueDay: 1 }),
+  paies: () => ({ freq: "quinzaine", firstDate: iso(today()) }),
+  charges: () => ({ freq: "mensuel", day: 1, cat: "Logement" }),
+  depenses: () => ({ date: iso(periodOf(tab === "depenses" ? viewAnchor : today()).start), cat: "Épicerie" }),
+  dettes: () => ({ freq: "mensuel", rate: 0, dueDay: 1 }),
 };
+// Pay periods offered when filing an expense: a few back, the current one, and the next two.
+function periodOptions(selectedIso) {
+  const cur = periodOf(today()), list = [cur];
+  for (let i = 0; i < 8; i++) list.unshift(prevPeriod(list[0]));
+  for (let i = 0; i < 2; i++) list.push(nextPeriod(list[list.length - 1]));
+  if (selectedIso && !list.some(p => iso(p.start) === selectedIso)) list.unshift(periodOf(parse(selectedIso)));
+  const curIso = iso(cur.start);
+  return list.reverse().map(p => { const v = iso(p.start); return [v, periodLabel(p) + (v === curIso ? " (actuelle)" : "")]; });
+}
 
 function openSheet(html, onMount) {
   const root = $("#sheet-root");
@@ -589,13 +631,15 @@ function openForm(kind, id) {
   const def = FORMS[kind], item = id ? state[kind].find(x => x.id === id) : DEFAULTS[kind]();
   if (!item) return;
   const fields = def.fields.map(([k, label, type, ph, hint]) => {
-    const v = item[k] ?? "";
+    let v = item[k] ?? "";
     let input;
+    if (type === "payperiod") { v = iso(periodOf(parse(v || iso(today()))).start); type = "select"; ph = periodOptions(v); }
+    if (k === "freq" && !v) v = "mensuel";
     if (type === "select") input = `<select id="f-${k}" name="${k}">${ph.map(([val, l]) => `<option value="${esc(val)}"${String(v) === val ? " selected" : ""}>${esc(l)}</option>`).join("")}</select>`;
     else if (type === "date") input = `<input id="f-${k}" name="${k}" type="date" value="${esc(v)}" required>`;
     else if (type === "text") input = `<input id="f-${k}" name="${k}" type="text" value="${esc(v)}" placeholder="${esc(ph || "")}" maxlength="80" required>`;
     else input = `<input id="f-${k}" name="${k}" type="text" inputmode="decimal" value="${esc(v)}" placeholder="${type === "int" ? "1" : "0"}" autocomplete="off">`;
-    return `<div class="field"><label for="f-${k}">${esc(label)}</label>${input}${hint ? `<span class="hint">${esc(hint)}</span>` : ""}</div>`;
+    return `<div class="field" id="field-${k}"><label for="f-${k}">${esc(label)}</label>${input}${hint ? `<span class="hint">${esc(hint)}</span>` : ""}</div>`;
   }).join("");
   openSheet(`<form id="item-form" novalidate style="display:grid;gap:14px">
     <h3>${id ? "Modifier" : "Ajouter"} : ${esc(def.title.toLowerCase())}</h3>${fields}
@@ -603,6 +647,11 @@ function openForm(kind, id) {
     <div class="sheet-actions">${id ? `<button class="btn danger" type="button" id="f-delete">Supprimer</button>` : ""}
       <div class="right"><button class="btn ghost" type="button" id="f-cancel">Annuler</button><button class="btn" type="submit" id="f-save">Enregistrer</button></div></div></form>`, root => {
     $("#f-cancel", root).onclick = closeSheet;
+    const freqSel = $("#f-freq", root), dayField = $("#field-day", root) || $("#field-dueDay", root);
+    if (freqSel && dayField && kind !== "paies") {
+      const sync = () => { dayField.hidden = freqSel.value === "paie"; };
+      freqSel.onchange = sync; sync();
+    }
     if (id) $("#f-delete", root).onclick = () => {
       const prev = snapshot(); state[kind] = state[kind].filter(x => x.id !== id); closeSheet(); commit("Supprimé", prev);
     };
@@ -613,8 +662,9 @@ function openForm(kind, id) {
     const saveItem = () => {
       const out = { id: id || uid() };
       for (const [k, label, type] of def.fields) {
+        if ((k === "day" || k === "dueDay") && $("#f-freq", root)?.value === "paie") { out[k] = item[k] || 1; continue; }
         const raw = $("#f-" + k, root).value.trim();
-        if (type === "text" || type === "select" || type === "date") {
+        if (type === "text" || type === "select" || type === "date" || type === "payperiod") {
           if (!raw) return formErr(`Remplissez « ${label} ».`);
           out[k] = raw;
         } else {
@@ -679,18 +729,18 @@ function toast(text, undo) {
 /* ---------- example ---------- */
 function loadExample() {
   const t = today(), y = t.getFullYear(), m = t.getMonth();
-  const d = n => iso(new Date(y, m, Math.min(n, dim(y, m))));
-  const lastPay = addDays(t, -9);
+  const lastPay = addDays(t, -5), d = n => iso(addDays(t, -n));
   state = Object.assign(DEFAULT(), {
     currency: state.currency, example: true, balance: 640, balanceDate: iso(t),
-    paies: [{ id: uid(), label: "Salaire", amount: 2150, firstDate: iso(lastPay), freq: "mensuel" },
+    paies: [{ id: uid(), label: "Salaire", amount: 1080, firstDate: iso(lastPay), freq: "quinzaine" },
             { id: uid(), label: "Prime", amount: 300, firstDate: iso(new Date(y, 11, 15)), freq: "unique" }],
     charges: [{ id: uid(), label: "Loyer", amount: 780, day: 5, cat: "Logement" },
               { id: uid(), label: "Électricité", amount: 65, day: 12, cat: "Énergie" },
               { id: uid(), label: "Internet et mobile", amount: 45, day: 15, cat: "Télécom" },
               { id: uid(), label: "Assurance auto", amount: 58, day: 10, cat: "Assurance" },
-              { id: uid(), label: "Streaming", amount: 22, day: 20, cat: "Abonnements" }],
-    dettes: [{ id: uid(), label: "Carte de crédit", total: 3000, remaining: 2400, monthly: 150, rate: 19.9, dueDay: 22 },
+              { id: uid(), label: "Streaming", amount: 22, day: 20, cat: "Abonnements" },
+              { id: uid(), label: "Essence", amount: 55, freq: "paie", day: 1, cat: "Transport" }],
+    dettes: [{ id: uid(), label: "Carte de crédit", total: 3000, remaining: 2400, monthly: 75, freq: "paie", rate: 19.9, dueDay: 1 },
              { id: uid(), label: "Prêt auto", total: 12000, remaining: 7800, monthly: 260, rate: 4.9, dueDay: 8 }],
     depenses: [{ id: uid(), label: "Courses", amount: 86.4, date: d(2), cat: "Épicerie" },
                { id: uid(), label: "Restaurant", amount: 42, date: d(6), cat: "Restaurants" },
@@ -705,18 +755,18 @@ function loadExample() {
 /* ---------- advisor ---------- */
 let turns = [], streaming = null, ctl = null, sampleFn = undefined;
 function advisorData() {
-  const t = today(), st = monthStats(t.getFullYear(), t.getMonth());
-  const pm = new Date(t.getFullYear(), t.getMonth() - 1, 1), prev = monthStats(pm.getFullYear(), pm.getMonth());
+  const t = today(), per = periodOf(t), st = periodStats(per), prev = periodStats(prevPeriod(per));
   const np = nextPay();
   return {
     aujourdhui: iso(t), devise: state.currency,
     solde_compte: state.balance, solde_saisi_le: state.balanceDate,
     prochaine_paie: np ? { date: iso(np.d), montant: np.amount, dans_jours: dayDiff(t, np.d) } : null,
     paies: state.paies.map(p => ({ nom: p.label, montant: p.amount, frequence: p.freq, date_reference: p.firstDate })),
-    charges_fixes_mensuelles: state.charges.map(c => ({ nom: c.label, montant: c.amount, jour: c.day, categorie: c.cat })),
-    dettes: state.dettes.map(x => { const po = payoff(x); return { nom: x.label, depart: x.total, restant: x.remaining, mensualite: x.monthly, taux_annuel_pct: x.rate, jour: x.dueDay, mois_restants: po ? (po.months === Infinity ? "jamais (mensualité < intérêts)" : po.months) : null, interets_restants_estimes: po && isFinite(po.months) ? Math.round(po.interest) : null }; }),
-    mois_en_cours: { revenus: round2(st.income), charges_fixes: round2(st.charges), mensualites_dettes: round2(st.debts), depenses_variables: round2(st.spent), depenses_par_categorie: st.byCat, reste_a_vivre: round2(st.left), jours_restants_dans_le_mois: dim(t.getFullYear(), t.getMonth()) - t.getDate() },
-    mois_precedent: { depenses_variables: round2(prev.spent), depenses_par_categorie: prev.byCat },
+    charges_fixes: state.charges.map(c => ({ nom: c.label, montant: c.amount, quand: c.freq === "paie" ? "à chaque paie" : `le ${c.day} de chaque mois`, categorie: c.cat })),
+    dettes: state.dettes.map(x => { const po = payoff(x); return { nom: x.label, depart: x.total, restant: x.remaining, paiement: x.monthly, quand: x.freq === "paie" ? "à chaque paie" : `le ${x.dueDay} de chaque mois`, taux_annuel_pct: x.rate, mois_restants: po ? (po.months === Infinity ? "jamais (paiement < intérêts)" : po.months) : null, interets_restants_estimes: po && isFinite(po.months) ? Math.round(po.interest) : null }; }),
+    budget_organise_par: per.monthly ? "mois (aucune paie récurrente saisie)" : "période de paie (d'une paie à la veille de la suivante)",
+    periode_actuelle: { du: iso(per.start), au: iso(per.end), revenus: round2(st.income), charges_fixes: round2(st.charges), paiements_dettes: round2(st.debts), depenses_variables: round2(st.spent), depenses_par_categorie: st.byCat, reste_a_vivre: round2(st.left), jours_restants: dayDiff(t, per.end) + 1 },
+    periode_precedente: { depenses_variables: round2(prev.spent), depenses_par_categorie: prev.byCat, reste_a_vivre: round2(prev.left) },
     prochains_30_jours: events(t, addDays(t, 30)).slice(0, 25).map(e => ({ date: iso(e.d), libelle: e.label, montant: e.amount, type: e.kind })),
     donnees_exemple: !!state.example,
   };
@@ -728,6 +778,7 @@ Voici ses données financières à jour (JSON) :
 ${JSON.stringify(advisorData())}
 
 Règles :
+- Son budget est organisé par période de paie (toutes les 2 semaines) : raisonne par paie, pas par mois, sauf si on te le demande.
 - Appuie chaque conseil sur ses vrais chiffres, en ${state.currency}. Cite les montants.
 - Donne au plus 3 actions concrètes, classées par priorité, avec un montant ou une date quand c'est possible.
 - Sois bref : moins de 220 mots, sauf si on te demande plus de détails.
@@ -815,7 +866,7 @@ $("#main").addEventListener("click", e => {
   else if (act === "balance") openBalance();
   else if (act === "load-example") loadExample();
   else if (act === "clear-example") { const prev = snapshot(); const cur = state.currency; state = DEFAULT(); state.currency = cur; commit("Exemple effacé", prev); }
-  else if (act === "month") { let { y, m } = viewMonth; m += +el.dataset.d; if (m < 0) { m = 11; y--; } if (m > 11) { m = 0; y++; } viewMonth = { y, m }; render(); }
+  else if (act === "period") { const p = periodOf(viewAnchor); viewAnchor = (+el.dataset.d < 0 ? prevPeriod(p) : nextPeriod(p)).start; render(); }
   else if (act === "paid") {
     const t = state.dettes.find(x => x.id === el.dataset.id); if (!t) return;
     const prev = snapshot(); t.remaining = round2(Math.max(0, +t.remaining - +t.monthly)); commit(`${t.label} : ${money(+t.remaining)} restant`, prev);
