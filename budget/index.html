@@ -282,10 +282,10 @@ const fmtDay = d => d.toLocaleDateString("fr-FR", { weekday: "short", day: "nume
 const fmtMonth = (y, m) => new Date(y, m, 1).toLocaleDateString("fr-FR", { month: "long", year: "numeric" });
 const MON = ["janv", "févr", "mars", "avr", "mai", "juin", "juil", "août", "sept", "oct", "nov", "déc"];
 
-const CURRENCIES = [["EUR", "Euro (€)"], ["CAD", "Dollar canadien ($)"], ["USD", "Dollar US ($)"], ["CHF", "Franc suisse"], ["MAD", "Dirham marocain"], ["TND", "Dinar tunisien"], ["DZD", "Dinar algérien"], ["XOF", "Franc CFA"]];
+const CURRENCIES = [["CAD", "Dollar canadien ($)"], ["EUR", "Euro (€)"], ["USD", "Dollar US ($)"], ["CHF", "Franc suisse"], ["MAD", "Dirham marocain"], ["TND", "Dinar tunisien"], ["DZD", "Dinar algérien"], ["XOF", "Franc CFA"]];
 let nf = null;
 function money(n, signed) {
-  if (!nf || nf._c !== state.currency) { nf = new Intl.NumberFormat("fr-FR", { style: "currency", currency: state.currency || "EUR", maximumFractionDigits: 2, minimumFractionDigits: 0 }); nf._c = state.currency; }
+  if (!nf || nf._c !== state.currency) { nf = new Intl.NumberFormat("fr-CA", { style: "currency", currency: state.currency || "CAD", maximumFractionDigits: 2, minimumFractionDigits: 0 }); nf._c = state.currency; }
   const s = nf.format(Math.abs(n));
   if (!signed) return n < 0 ? "−" + s : s;
   return (n < 0 ? "−" : "+") + s;
@@ -297,7 +297,7 @@ const CAT_CHARGES = ["Logement", "Énergie", "Télécom", "Assurance", "Abonneme
 const CAT_DEP = ["Épicerie", "Restaurants", "Transport", "Loisirs", "Shopping", "Santé", "Maison", "Cadeaux", "Autre"];
 
 /* ---------- state ---------- */
-const DEFAULT = () => ({ v: 1, currency: "EUR", balance: null, balanceDate: null, example: false, paies: [], charges: [], depenses: [], dettes: [] });
+const DEFAULT = () => ({ v: 1, currency: "CAD", balance: null, balanceDate: null, example: false, paies: [], charges: [], depenses: [], dettes: [] });
 function normalize(d) {
   // Deep copy: snapshots from the store are frozen, and the page edits its state in place.
   const s = Object.assign(DEFAULT(), d ? JSON.parse(JSON.stringify(d)) : {});
