@@ -127,6 +127,16 @@ ul.rows li:first-child { border-top: 0; }
 .row-end { text-align: right; display: grid; gap: 2px; justify-items: end; }
 .row-end .bal { font-size: .76rem; color: var(--muted); }
 li.clickable { cursor: pointer; }
+ul.rows li.chk { display: block; }
+.check { display: grid; grid-template-columns: auto 1fr auto; gap: 12px; align-items: center; cursor: pointer; position: relative; }
+.check input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+.box { width: 26px; height: 26px; border-radius: 8px; border: 2px solid var(--line); background: var(--surface); display: grid; place-items: center; }
+.box::after { content: ""; width: 7px; height: 12px; border: solid transparent; border-width: 0 3px 3px 0; transform: translateY(-2px) rotate(45deg); }
+.check input:checked + .box { background: var(--pos); border-color: var(--pos); }
+.check input:checked + .box::after { border-color: var(--surface); }
+.check input:focus-visible + .box { outline: 2px solid var(--accent); outline-offset: 2px; }
+li.done .t { text-decoration: line-through; color: var(--muted); }
+li.done .num { color: var(--muted); }
 li.clickable:hover .t { color: var(--accent); }
 
 .tag { display: inline-block; font-size: .7rem; font-weight: 600; padding: 2px 8px; border-radius: 99px; background: var(--surface-2); color: var(--muted); }
@@ -199,7 +209,7 @@ li.clickable:hover .t { color: var(--accent); }
 .sheet-actions .right { display: flex; gap: 8px; margin-left: auto; }
 .err { color: var(--neg); font-size: .84rem; }
 
-.toast { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(84px + env(safe-area-inset-bottom, 0px)); z-index: 50; background: var(--ink); color: var(--bg); border-radius: 12px; padding: 10px 14px; display: flex; gap: 14px; align-items: center; font-size: .9rem; box-shadow: var(--shadow); max-width: calc(100% - 32px); }
+.toast { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(84px + env(safe-area-inset-bottom, 0px)); z-index: 50; background: var(--ink); color: var(--bg); border-radius: 12px; padding: 10px 14px; display: flex; gap: 14px; align-items: center; font-size: .9rem; box-shadow: var(--shadow); width: max-content; max-width: calc(100% - 32px); }
 .toast button { background: none; border: 0; color: var(--accent-soft); font-weight: 700; }
 @media (min-width: 760px) { .toast { bottom: 24px; } }
 @media (prefers-reduced-motion: no-preference) { .bar-fill, .progress > div { transition: width .4s ease; } }
@@ -297,11 +307,12 @@ const CAT_CHARGES = ["Logement", "Énergie", "Télécom", "Assurance", "Abonneme
 const CAT_DEP = ["Épicerie", "Restaurants", "Transport", "Loisirs", "Shopping", "Santé", "Maison", "Cadeaux", "Autre"];
 
 /* ---------- state ---------- */
-const DEFAULT = () => ({ v: 1, currency: "CAD", balance: null, balanceDate: null, example: false, paies: [], charges: [], depenses: [], dettes: [] });
+const DEFAULT = () => ({ v: 1, currency: "CAD", balance: null, balanceDate: null, example: false, paies: [], charges: [], depenses: [], dettes: [], paid: {} });
 function normalize(d) {
   // Deep copy: snapshots from the store are frozen, and the page edits its state in place.
   const s = Object.assign(DEFAULT(), d ? JSON.parse(JSON.stringify(d)) : {});
   for (const k of ["paies", "charges", "depenses", "dettes"]) if (!Array.isArray(s[k])) s[k] = [];
+  if (!s.paid || typeof s.paid !== "object" || Array.isArray(s.paid)) s.paid = {};
   return s;
 }
 let state = DEFAULT();
@@ -391,7 +402,13 @@ function events(start, end) {
   const ev = [];
   for (const p of state.paies) for (const d of payDates(p, start, end)) ev.push({ d, label: p.label, amount: +p.amount, kind: "pay", id: p.id });
   for (const c of state.charges) for (const d of recurDates(c, "day", start, end)) ev.push({ d, label: c.label, amount: -c.amount, kind: "charge", cat: c.cat, id: c.id });
-  for (const t of state.dettes) if (+t.remaining > 0 && +t.monthly > 0) for (const d of recurDates(t, "dueDay", start, end)) ev.push({ d, label: t.label, amount: -Math.min(+t.monthly, +t.remaining), kind: "debt", id: t.id });
+  for (const t of state.dettes) if (+t.monthly > 0) for (const d of recurDates(t, "dueDay", start, end)) {
+    // A ticked payment stays listed at the amount it took off the debt, even once the debt reaches 0.
+    const done = state.paid[`debt:${t.id}:${iso(d)}`];
+    if (done) ev.push({ d, label: t.label, amount: -(done.applied || +t.monthly), kind: "debt", id: t.id });
+    else if (+t.remaining > 0) ev.push({ d, label: t.label, amount: -Math.min(+t.monthly, +t.remaining), kind: "debt", id: t.id });
+  }
+  for (const e of ev) { e.key = `${e.kind}:${e.id}:${iso(e.d)}`; e.paid = e.kind !== "pay" && !!state.paid[e.key]; }
   ev.sort((a, b) => a.d - b.d || b.amount - a.amount);
   return ev;
 }
@@ -406,6 +423,41 @@ function periodStats(p) {
   const byCat = {};
   for (const d of deps) byCat[d.cat || "Autre"] = (byCat[d.cat || "Autre"] || 0) + +d.amount;
   return { income, charges, debts, spent, left: income - charges - debts - spent, byCat, deps, ev };
+}
+/* Checklist: state.paid maps "kind:id:YYYY-MM-DD" to { at, applied } (applied = amount taken off a debt). */
+function togglePaid(key) {
+  const [kind, id, day] = key.split(":");
+  const prev = snapshot(), t = kind === "debt" ? state.dettes.find(x => x.id === id) : null;
+  const done = state.paid[key];
+  if (done) {
+    if (t && done.applied) t.remaining = round2(+t.remaining + done.applied);
+    delete state.paid[key];
+  } else {
+    const applied = t ? round2(Math.min(+t.remaining, +t.monthly)) : 0;
+    if (t) t.remaining = round2(+t.remaining - applied);
+    state.paid[key] = { at: iso(today()), applied };
+  }
+  const cutoff = iso(addDays(today(), -200));
+  for (const k of Object.keys(state.paid)) if (k.split(":")[2] < cutoff) delete state.paid[k];
+  commit(t ? `${t.label} : ${money(+t.remaining)} restant` : null, t ? prev : null);
+}
+function renderChecklist(per, title) {
+  const items = periodStats(per).ev.filter(e => e.kind !== "pay"), t = iso(today());
+  const head = `<div class="sec-head"><h2>${esc(title)}</h2><span class="small muted">${esc(periodLabel(per))}</span></div>`;
+  if (!items.length) return `<div class="card" style="display:grid;gap:10px">${head}<div class="empty">Aucune charge ni dette à payer sur cette paie.</div></div>`;
+  const done = items.filter(e => e.paid).length, left = items.filter(e => !e.paid).reduce((s, e) => s - e.amount, 0);
+  const rows = items.map(e => {
+    const late = !e.paid && iso(e.d) < t;
+    const tag = e.paid ? `<span class="tag pay">Payé</span>` : late ? `<span class="tag danger">En retard</span>` : e.kind === "debt" ? `<span class="tag debt">Dette</span>` : `<span class="tag">${esc(e.cat || "Charge")}</span>`;
+    return `<li class="chk${e.paid ? " done" : ""}"><label class="check">
+      <input type="checkbox" id="chk-${esc(e.key)}" data-act="toggle-paid" data-key="${esc(e.key)}"${e.paid ? " checked" : ""}><span class="box" aria-hidden="true"></span>
+      <div class="row-main"><div class="t">${esc(e.label)}</div><div class="s">${esc(fmtDay(e.d))} · ${tag}</div></div>
+      <span class="num">${money(-e.amount)}</span></label></li>`;
+  }).join("");
+  return `<div class="card" style="display:grid;gap:10px">${head}
+    <div class="sec-head"><span><b class="num">${done}</b> sur <b class="num">${items.length}</b> payés</span><span class="small">${left > 0 ? `Reste à payer <b class="num">${money(left)}</b>` : `<span class="pos"><b>Tout est payé</b></span>`}</span></div>
+    <div class="progress"><div style="width:${done / items.length * 100}%"></div></div>
+    <ul class="rows">${rows}</ul></div>`;
 }
 function nextPay() {
   const t = today(), ev = events(t, addDays(t, 400)).filter(e => e.kind === "pay");
@@ -470,10 +522,10 @@ function renderApercu() {
   const hasBal = state.balance !== null && state.balance !== "" && isFinite(+state.balance);
   let bal = hasBal ? +state.balance : 0, lowest = bal, lowDay = null;
   const rows = ev.slice(0, 40).map(e => {
-    bal += e.amount;
+    if (!e.paid) bal += e.amount;
     if (bal < lowest) { lowest = bal; lowDay = e.d; }
-    const tag = e.kind === "pay" ? `<span class="tag pay">Paie</span>` : e.kind === "debt" ? `<span class="tag debt">Dette</span>` : `<span class="tag">${esc(e.cat || "Charge")}</span>`;
-    return `<li>${dateChip(e.d)}<div class="row-main"><div class="t">${esc(e.label)}</div><div class="s">${tag}</div></div>
+    const tag = e.paid ? `<span class="tag pay">Déjà payé</span>` : e.kind === "pay" ? `<span class="tag pay">Paie</span>` : e.kind === "debt" ? `<span class="tag debt">Dette</span>` : `<span class="tag">${esc(e.cat || "Charge")}</span>`;
+    return `<li${e.paid ? ' class="done"' : ""}>${dateChip(e.d)}<div class="row-main"><div class="t">${esc(e.label)}</div><div class="s">${tag}</div></div>
       <div class="row-end"><span class="num ${e.amount > 0 ? "pos" : ""}">${money(e.amount, true)}</span>${hasBal ? `<span class="bal num ${bal < 0 ? "neg" : ""}">solde ${money(bal)}</span>` : ""}</div></li>`;
   }).join("");
   const balLine = hasBal
@@ -483,7 +535,7 @@ function renderApercu() {
     <div class="sec-head"><h2>Les 30 prochains jours</h2><button class="btn ghost small" data-act="balance" type="button">${hasBal ? "Mettre à jour le solde" : "Saisir mon solde"}</button></div>
     ${balLine}
     ${rows ? `<ul class="rows">${rows}</ul>` : `<div class="empty">Rien de prévu dans les 30 prochains jours.</div>`}
-    <div class="small muted">Les dépenses courantes à venir ne sont pas comptées : gardez une marge.</div></div>`;
+    <div class="small muted">Ce qui est coché comme payé ne change plus le solde prévu. Les dépenses courantes à venir ne sont pas comptées : gardez une marge.</div></div>`;
 
   const cats = Object.entries(st.byCat).sort((a, b) => b[1] - a[1]);
   const max = cats.length ? cats[0][1] : 1;
@@ -493,7 +545,7 @@ function renderApercu() {
       : `<div class="empty">Aucune dépense notée sur cette paie. Ajoutez vos courses, sorties ou achats pour suivre où va l'argent.</div>`}
     <button class="btn ghost small" data-act="ask" data-q="Fais le bilan de ma paie actuelle" type="button" style="justify-self:start">Demander un bilan au conseiller</button></div>`;
 
-  return `<div class="hero">${payHtml}${rav}</div>${figs}<div class="two">${projection}${spend}</div>`;
+  return `<div class="hero">${payHtml}${rav}</div>${figs}${renderChecklist(per, "À payer sur cette paie")}<div class="two">${projection}${spend}</div>`;
 }
 
 function listCard(title, kind, items, rowFn, emptyText, addLabel, extra = "") {
@@ -541,7 +593,7 @@ function renderDepenses() {
       <div class="row-end"><span class="num">${money(-d.amount)}</span></div></li>`).join("")}</ul>`
       : `<div class="empty">Aucune dépense sur cette paie.</div>`}
     <div class="small muted">Inutile d'ajouter ici vos charges fixes ou vos paiements de dettes : ils sont déjà comptés.</div></div>`;
-  return `<div class="two">${depCard}${charges}</div>`;
+  return `${renderChecklist(per, isNow ? "À payer sur cette paie" : "À payer sur cette période")}<div class="two">${depCard}${charges}</div>`;
 }
 
 function renderDettes() {
@@ -767,7 +819,8 @@ function advisorData() {
     budget_organise_par: per.monthly ? "mois (aucune paie récurrente saisie)" : "période de paie (d'une paie à la veille de la suivante)",
     periode_actuelle: { du: iso(per.start), au: iso(per.end), revenus: round2(st.income), charges_fixes: round2(st.charges), paiements_dettes: round2(st.debts), depenses_variables: round2(st.spent), depenses_par_categorie: st.byCat, reste_a_vivre: round2(st.left), jours_restants: dayDiff(t, per.end) + 1 },
     periode_precedente: { depenses_variables: round2(prev.spent), depenses_par_categorie: prev.byCat, reste_a_vivre: round2(prev.left) },
-    prochains_30_jours: events(t, addDays(t, 30)).slice(0, 25).map(e => ({ date: iso(e.d), libelle: e.label, montant: e.amount, type: e.kind })),
+    prochains_30_jours: events(t, addDays(t, 30)).slice(0, 25).map(e => ({ date: iso(e.d), libelle: e.label, montant: e.amount, type: e.kind, deja_paye: e.paid })),
+    a_payer_cette_paie: st.ev.filter(e => e.kind !== "pay").map(e => ({ date: iso(e.d), libelle: e.label, montant: -e.amount, deja_paye: e.paid })),
     donnees_exemple: !!state.example,
   };
 }
@@ -867,9 +920,13 @@ $("#main").addEventListener("click", e => {
   else if (act === "load-example") loadExample();
   else if (act === "clear-example") { const prev = snapshot(); const cur = state.currency; state = DEFAULT(); state.currency = cur; commit("Exemple effacé", prev); }
   else if (act === "period") { const p = periodOf(viewAnchor); viewAnchor = (+el.dataset.d < 0 ? prevPeriod(p) : nextPeriod(p)).start; render(); }
+  else if (act === "toggle-paid") togglePaid(el.dataset.key);
   else if (act === "paid") {
+    // Tick the oldest unpaid payment of this debt from the current pay onward, so the checklist stays in step.
     const t = state.dettes.find(x => x.id === el.dataset.id); if (!t) return;
-    const prev = snapshot(); t.remaining = round2(Math.max(0, +t.remaining - +t.monthly)); commit(`${t.label} : ${money(+t.remaining)} restant`, prev);
+    const next = events(periodOf(today()).start, addDays(today(), 70)).find(e => e.kind === "debt" && e.id === t.id && !e.paid);
+    if (next) togglePaid(next.key);
+    else { const prev = snapshot(); t.remaining = round2(Math.max(0, +t.remaining - +t.monthly)); commit(`${t.label} : ${money(+t.remaining)} restant`, prev); }
   }
   else if (act === "ask") { go("conseil"); ask(el.dataset.q); }
 });
