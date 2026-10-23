@@ -299,7 +299,8 @@ const CAT_DEP = ["Épicerie", "Restaurants", "Transport", "Loisirs", "Shopping",
 /* ---------- state ---------- */
 const DEFAULT = () => ({ v: 1, currency: "EUR", balance: null, balanceDate: null, example: false, paies: [], charges: [], depenses: [], dettes: [] });
 function normalize(d) {
-  const s = Object.assign(DEFAULT(), d || {});
+  // Deep copy: snapshots from the store are frozen, and the page edits its state in place.
+  const s = Object.assign(DEFAULT(), d ? JSON.parse(JSON.stringify(d)) : {});
   for (const k of ["paies", "charges", "depenses", "dettes"]) if (!Array.isArray(s[k])) s[k] = [];
   return s;
 }
@@ -607,6 +608,9 @@ function openForm(kind, id) {
     };
     $("#item-form", root).onsubmit = e => {
       e.preventDefault();
+      try { saveItem(); } catch (err) { formErr("Impossible d'enregistrer : " + (err && err.message || err)); }
+    };
+    const saveItem = () => {
       const out = { id: id || uid() };
       for (const [k, label, type] of def.fields) {
         const raw = $("#f-" + k, root).value.trim();
