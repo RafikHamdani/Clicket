@@ -190,6 +190,13 @@ li.clickable:hover .t { color: var(--accent); }
 .chip:hover { border-color: var(--accent); color: var(--accent); }
 .composer { display: flex; gap: 8px; align-items: flex-end; }
 .composer textarea { flex: 1; min-width: 0; resize: none; border: 1px solid var(--line); background: var(--surface); border-radius: 14px; padding: 11px 14px; min-height: 46px; max-height: 160px; }
+.voice-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.voice-bar .btn { display: inline-flex; align-items: center; gap: 8px; }
+.voice-bar svg { width: 18px; height: 18px; flex: none; }
+.voice-bar .btn.live { background: var(--neg); color: var(--surface); border-color: var(--neg); }
+.switch { display: inline-flex; align-items: center; gap: 8px; font-size: .86rem; color: var(--muted); cursor: pointer; }
+.switch input { width: 18px; height: 18px; accent-color: var(--accent); }
+.voice-hint { font-size: .86rem; background: var(--accent-soft); border-radius: 12px; padding: 10px 12px; }
 .advisor-id { display: flex; gap: 12px; align-items: center; }
 .avatar { width: 42px; height: 42px; border-radius: 12px; background: var(--accent); color: var(--accent-ink); display: grid; place-items: center; font-family: var(--f-display); font-weight: 700; font-size: 1.1rem; flex: none; }
 
@@ -258,6 +265,12 @@ li.clickable:hover .t { color: var(--accent); }
             <button class="chip" type="button">Où est-ce que je dépense trop ?</button>
             <button class="chip" type="button">Est-ce que je tiens jusqu'à ma prochaine paie ?</button>
           </div>
+          <div class="voice-bar">
+            <button class="btn" id="voice-bilan" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M11 5 6 9H3v6h3l5 4zM15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13"/></svg><span>Bilan vocal</span></button>
+            <button class="btn ghost" id="voice-mic" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg><span>Parler</span></button>
+            <label class="switch" id="voice-switch"><input type="checkbox" id="voice-on"> Lire les réponses à voix haute</label>
+          </div>
+          <div class="voice-hint" id="voice-hint" hidden></div>
           <form class="composer" id="chat-form">
             <textarea id="chat-input" rows="1" placeholder="Posez votre question sur votre argent…"></textarea>
             <button class="btn" id="chat-send" type="submit">Envoyer</button>
@@ -880,27 +893,110 @@ const ERRS = {
   refused: "Le conseiller n'a pas pu répondre à cette question. Reformulez-la.",
   prompt_too_large: "Trop de données à envoyer. Commencez une nouvelle discussion.",
 };
-async function ask(q) {
+/* ---------- voice ---------- */
+// Output: the browser's speech synthesis. Input: speech recognition where the frame allows the
+// microphone; otherwise the phone keyboard's own dictation key fills the text box.
+const synth = window.speechSynthesis || null;
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition || null;
+const LS_VOICE = "mon-budget-voice-v1";
+let voiceOn = !!lsGet(LS_VOICE), speaking = false, listening = false, rec = null, micBlocked = false;
+const SPOKEN = `
+
+IMPORTANT : cette réponse sera lue à voix haute. Écris des phrases courtes et naturelles, comme si tu parlais. Pas de listes, pas de gras, pas de symboles ni d'émojis. Au plus 130 mots. Écris les montants comme on les dit, par exemple « 1 800 dollars ».`;
+function pickVoice() {
+  const vs = synth ? synth.getVoices() : [];
+  return vs.find(v => /^fr[-_]CA/i.test(v.lang)) || vs.find(v => /^fr/i.test(v.lang)) || null;
+}
+function unlockVoice() {
+  // iOS only lets a page speak once speech has started inside a tap.
+  if (!synth) return;
+  try { synth.cancel(); const u = new SpeechSynthesisUtterance(" "); u.volume = 0; synth.speak(u); } catch {}
+}
+function speak(text) {
+  if (!synth) return;
+  const plain = text.replace(/\*\*(.+?)\*\*/g, "$1").replace(/^\s*([-*•]|\d+[.)])\s+/gm, "").replace(/[#*_`]/g, "").replace(/\(Réponse .*?\)/g, "");
+  const parts = plain.split(/(?<=[.!?…:;])\s+|\n+/).map(s => s.trim()).filter(Boolean);
+  try { synth.cancel(); } catch {}
+  if (!parts.length) return;
+  const voice = pickVoice();
+  speaking = true; voiceUI();
+  parts.forEach((p, i) => {
+    const u = new SpeechSynthesisUtterance(p);
+    u.lang = voice ? voice.lang : "fr-CA"; if (voice) u.voice = voice; u.rate = 1.02;
+    if (i === parts.length - 1) u.onend = u.onerror = () => { speaking = false; voiceUI(); };
+    synth.speak(u);
+  });
+}
+function stopVoice() { try { synth && synth.cancel(); } catch {} speaking = false; voiceUI(); }
+function voiceUI() {
+  const bil = $("#voice-bilan"), mic = $("#voice-mic");
+  $("#voice-switch").hidden = !synth;
+  $("#voice-on").checked = voiceOn;
+  bil.querySelector("span").textContent = speaking ? "Arrêter la voix" : streaming !== null ? "Je prépare…" : "Bilan vocal";
+  bil.classList.toggle("live", speaking);
+  bil.disabled = !speaking && streaming !== null;
+  mic.querySelector("span").textContent = listening ? "J'écoute… touchez pour finir" : "Parler";
+  mic.classList.toggle("live", listening);
+}
+function dictationHint() {
+  micBlocked = true; listening = false;
+  voiceOn = !!synth; lsSet(LS_VOICE, voiceOn); voiceUI();
+  const h = $("#voice-hint");
+  h.innerHTML = "Pour parler au conseiller : touchez la zone de texte ci-dessous, puis le <b>micro du clavier</b> de votre iPhone (en bas à droite) et dictez votre question. Touchez <b>Envoyer</b> : la réponse sera lue à voix haute.";
+  h.hidden = false;
+  $("#chat-input").focus();
+}
+$("#voice-on").addEventListener("change", e => { voiceOn = e.target.checked; lsSet(LS_VOICE, voiceOn); if (voiceOn) unlockVoice(); else stopVoice(); });
+$("#voice-bilan").addEventListener("click", () => {
+  if (speaking) return stopVoice();
+  unlockVoice();
+  ask("Fais-moi un bilan vocal de ma situation financière : où j'en suis sur cette paie, ce qui reste à payer, où en sont mes dettes, et le conseil le plus important pour les deux prochaines semaines.", { voice: true });
+});
+$("#voice-mic").addEventListener("click", () => {
+  unlockVoice();
+  if (listening) { try { rec && rec.stop(); } catch {} return; }
+  if (!SR || micBlocked) return dictationHint();
+  try {
+    rec = new SR(); rec.lang = "fr-CA"; rec.interimResults = true; rec.continuous = false;
+    const inp = $("#chat-input");
+    rec.onresult = e => { inp.value = Array.from(e.results).map(r => r[0].transcript).join(""); };
+    rec.onerror = e => {
+      if (e.error === "aborted") return;
+      if (e.error === "no-speech") { const h = $("#voice-hint"); h.textContent = "Je n'ai rien entendu. Touchez « Parler » et posez votre question."; h.hidden = false; return; }
+      dictationHint();
+    };
+    rec.onend = () => {
+      listening = false; voiceUI();
+      const v = inp.value.trim();
+      if (v && !micBlocked) { inp.value = ""; ask(v, { voice: true }); }
+    };
+    stopVoice(); rec.start(); listening = true; voiceUI();
+  } catch { dictationHint(); }
+});
+
+async function ask(q, opts = {}) {
   q = q.trim(); if (!q || streaming !== null) return;
+  const spoken = !!(opts.voice || voiceOn) && !!synth;
   const errEl = $("#chat-err"); errEl.hidden = true;
   if (sampleFn === undefined) { try { sampleFn = await window.claude?.use?.("sample"); } catch { sampleFn = null; } }
   if (!sampleFn) { errEl.textContent = "Le conseiller fonctionne uniquement quand la page est ouverte dans Claude (claude.ai ou l'appli Claude), connecté à votre compte."; errEl.hidden = false; return; }
   turns.push({ role: "user", content: q });
-  streaming = ""; renderChat();
+  streaming = ""; renderChat(); voiceUI();
   ctl = new AbortController();
   let hist = turns.slice(-16); while (hist.length && hist[0].role !== "user") hist.shift();
   try {
-    const { text, truncated } = await sampleFn([{ role: "user", content: rules() }, ...hist], {
+    const { text, truncated } = await sampleFn([{ role: "user", content: rules() + (spoken ? SPOKEN : "") }, ...hist], {
       cache: false, signal: ctl.signal,
       onText: ({ text }) => { streaming = text; const el = $("#stream"); if (el) { el.classList.remove("thinking"); el.innerHTML = md(text); $("#chat-log").scrollTop = 1e9; } },
     });
     turns.push({ role: "assistant", content: text + (truncated ? "\n\n(Réponse coupée : demandez la suite.)" : "") });
+    if (spoken) speak(text);
   } catch (e) {
     if (e && e.text) turns.push({ role: "assistant", content: e.text + "\n\n(Réponse interrompue.)" });
     else if (!e || e.code !== "cancelled") turns.pop();
     if (e && e.code !== "cancelled") { errEl.textContent = ERRS[e.code] || "Le conseiller n'a pas répondu. Vérifiez votre connexion puis réessayez."; errEl.hidden = false; }
   } finally {
-    streaming = null; ctl = null; renderChat(); saveChat();
+    streaming = null; ctl = null; renderChat(); saveChat(); voiceUI();
   }
 }
 
@@ -930,21 +1026,23 @@ $("#main").addEventListener("click", e => {
   }
   else if (act === "ask") { go("conseil"); ask(el.dataset.q); }
 });
-$("#chat-chips").addEventListener("click", e => { const b = e.target.closest(".chip"); if (b) ask(b.textContent); });
+$("#chat-chips").addEventListener("click", e => { const b = e.target.closest(".chip"); if (b) { if (voiceOn) unlockVoice(); ask(b.textContent); } });
 $("#chat-form").addEventListener("submit", e => {
   e.preventDefault();
   if (streaming !== null) { ctl && ctl.abort(); return; }
+  if (voiceOn) unlockVoice();
   const inp = $("#chat-input"), v = inp.value; inp.value = ""; inp.style.height = ""; ask(v);
 });
 $("#chat-input").addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing && window.matchMedia("(min-width: 760px)").matches) { e.preventDefault(); $("#chat-form").requestSubmit(); } });
 $("#chat-input").addEventListener("input", e => { e.target.style.height = "auto"; e.target.style.height = Math.min(160, e.target.scrollHeight) + "px"; });
-$("#chat-clear").onclick = () => { if (streaming !== null) ctl && ctl.abort(); turns = []; renderChat(); saveChat(); };
+$("#chat-clear").onclick = () => { stopVoice(); if (streaming !== null) ctl && ctl.abort(); turns = []; renderChat(); saveChat(); };
 
 /* ---------- boot ---------- */
 async function boot() {
   const h = (location.hash || "").slice(1);
   if (["apercu", "paies", "depenses", "dettes", "conseil"].includes(h)) tab = h;
-  render(); renderChat();
+  render(); renderChat(); voiceUI();
+  if (synth && synth.onvoiceschanged !== undefined) synth.onvoiceschanged = () => {};
   let db = null, user = null, id = null;
   try { if (window.claude && claude.use) [db, user] = await Promise.all([claude.use("db"), claude.use("user")]); } catch {}
   try { id = user ? await user.id() : null; } catch {}
